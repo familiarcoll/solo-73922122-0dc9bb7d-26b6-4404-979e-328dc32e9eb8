@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>数仓分区回填计划</title>
+<title>数仓回填与敏感字段核查</title>
 <style>
   :root {
     --bg: #0f1420; --panel: #1a2233; --border: #2b3a55; --text: #dbe4f5;
@@ -69,14 +69,15 @@
 </head>
 <body>
 <header>
-  <h1>数仓分区回填计划</h1>
-  <span class="sub">录入依赖与运行记录 → 选择目标任务与业务日期 → 生成带执行波次的回填计划（快照持久化）</span>
+  <h1>数仓回填与敏感字段核查</h1>
+  <span class="sub">分区回填计划 · 开放报表列前逐列追溯敏感源字段是否全程直传（脱敏只截断所在路径）</span>
 </header>
 <nav>
   <button data-tab="tasks" class="active">任务与依赖</button>
   <button data-tab="records">运行记录</button>
   <button data-tab="generate">生成计划</button>
   <button data-tab="plans">计划列表</button>
+  <button data-tab="lineage">敏感字段核查</button>
 </nav>
 <main>
   <div id="msg" class="msg"></div>
@@ -159,10 +160,33 @@
     </div>
     <div id="plan-detail"></div>
   </section>
+  <!-- 敏感字段核查 -->
+  <section id="tab-lineage" class="tab">
+    <div class="panel">
+      <h2>敏感字段血缘核查（开放报表列前）</h2>
+      <div class="form-row" style="margin-bottom:10px">
+        <label>目标任务 <select id="l-target"></select></label>
+        <label>待核查列 <input id="l-columns" placeholder="逗号/空格分隔，如 phone, id_card" style="width:280px"></label>
+      </div>
+      <div class="form-row" style="margin-bottom:10px">
+        <label>敏感源字段清单 <input type="file" id="l-sensitive" accept=".csv,text/csv"></label>
+        <label>字段映射 <input type="file" id="l-mapping" accept=".csv,text/csv"></label>
+        <button onclick="runLineage()">开始核查</button>
+        <button class="ghost" onclick="downloadSamples()">下载示例 CSV</button>
+      </div>
+      <p class="hint">两份 CSV 均须 UTF-8 且 ≤ 256 KiB。敏感源清单表头 <code>任务,字段</code>；
+        字段映射表头 <code>下游任务,下游字段,上游任务,上游字段,直传/脱敏</code>，且每行（下游 ← 上游）必须对应「任务与依赖」中已有的直接依赖。</p>
+      <p class="hint">判定：存在全程直传到敏感源字段的路径 → <b>裸露</b>（列出该路径）；脱敏只截断所在路径，不遮住同列其他直传路径；
+        任务尚有上游依赖却缺少该字段映射、或映射成环 → <b>待核实</b>（不可判安全，已发现的裸露路径仍展示）；各列独立核查互不影响。</p>
+    </div>
+    <div id="lineage-result"></div>
+  </section>
 </main>
 
 <script>
 const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"']/g, c =>
+  ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
 const STATUS_CN = {ok:'已就绪', missing:'缺失', failed:'失败', stale:'版本过期'};
 let state = {tasks: [], dependencies: [], records: []};
 
@@ -180,6 +204,7 @@ async function api(path, opts) {
     try { j = await r.json(); } catch {}
     const detail = j && j.detail;
     const text = typeof detail === 'string' ? detail
+      : Array.isArray(detail) ? detail.join('；')
       : (detail && detail.reason) || JSON.stringify(detail || r.statusText);
     const err = new Error(text);
     err.status = r.status; err.body = text; err.payload = detail;
@@ -199,26 +224,26 @@ async function refresh() {
 /* ---------- 任务与依赖 ---------- */
 function renderTasks() {
   $('#task-rows').innerHTML = state.tasks.map(t => `<tr>
-    <td><code>${t.name}</code></td>
+    <td><code>${esc(t.name)}</code></td>
     <td>${t.granularity === 'daily' ? '日' : '小时'}</td>
     <td><span class="tag ver">v${t.config_version}</span></td>
-    <td>${t.description || ''}</td>
+    <td>${esc(t.description || '')}</td>
     <td><button class="ghost" onclick="bumpGran(${t.id},'${t.granularity}')">切换粒度</button>
         <button class="ghost" onclick="delTask(${t.id})">删除</button></td>
   </tr>`).join('');
 }
 function renderDeps() {
   $('#dep-rows').innerHTML = state.dependencies.map(d => `<tr>
-    <td><code>${d.downstream_name}</code></td>
-    <td><code>${d.upstream_name}</code></td>
+    <td><code>${esc(d.downstream_name)}</code></td>
+    <td><code>${esc(d.upstream_name)}</code></td>
     <td>${d.offset_days} 天</td>
     <td><button class="ghost" onclick="delDep(${d.id})">删除</button></td>
   </tr>`).join('');
 }
 function fillSelects() {
   const opts = state.tasks.map(t =>
-    `<option value="${t.id}">${t.name}（${t.granularity === 'daily' ? '日' : '小时'}, v${t.config_version}）</option>`).join('');
-  ['#d-down', '#d-up', '#r-task', '#p-target'].forEach(s => { $(s).innerHTML = opts; });
+    `<option value="${t.id}">${esc(t.name)}（${t.granularity === 'daily' ? '日' : '小时'}, v${t.config_version}）</option>`).join('');
+  ['#d-down', '#d-up', '#r-task', '#p-target', '#l-target'].forEach(s => { $(s).innerHTML = opts; });
 }
 async function addTask() {
   try {
@@ -262,10 +287,10 @@ function renderRecords() {
     const badTag = r.config_version > r.current_version
       ? ' <span class="tag failed">不一致</span>' : '';
     return `<tr>
-      <td><code>${r.task_name}</code></td><td>${r.partition}</td>
+      <td><code>${esc(r.task_name)}</code></td><td>${esc(r.partition)}</td>
       <td><span class="tag ${r.status === 'success' ? 'ok' : 'failed'}">${r.status}</span></td>
       <td>v${r.config_version}${staleTag}${badTag}</td><td>v${r.current_version}</td>
-      <td>${r.finished_at}</td>
+      <td>${esc(r.finished_at)}</td>
       <td><button class="ghost" onclick="delRecord(${r.id})">删除</button></td>
     </tr>`;
   }).join('');
@@ -296,7 +321,7 @@ async function generatePlan() {
     loadPlans();
   } catch (e) {
     const reason = (e.payload && e.payload.reason) || e.body;
-    box.innerHTML = `<div class="panel"><h2>生成被拒绝</h2><p>${reason}</p>
+    box.innerHTML = `<div class="panel"><h2>生成被拒绝</h2><p>${esc(reason)}</p>
       <p class="hint">该拒绝记录已留痕，可在「计划列表」中查看。</p></div>`;
     showMsg(reason, true);
     loadPlans();
@@ -309,10 +334,10 @@ async function loadPlans() {
       const s = p.summary_json ? JSON.parse(p.summary_json) : {};
       const sum = p.status === 'generated'
         ? `回填 ${s.backfill ?? 0} / 跳过 ${s.skip ?? 0} / ${s.waves ?? 0} 个波次`
-        : `<span class="hint">${p.reject_reason.slice(0, 60)}</span>`;
+        : `<span class="hint">${esc(p.reject_reason.slice(0, 60))}</span>`;
       return `<tr class="plan-row" onclick="showPlan(${p.id})">
-        <td>#${p.id}</td><td>${p.created_at}</td>
-        <td><code>${p.target_name}</code></td><td>${p.biz_date}</td>
+        <td>#${p.id}</td><td>${esc(p.created_at)}</td>
+        <td><code>${esc(p.target_name)}</code></td><td>${esc(p.biz_date)}</td>
         <td><span class="tag ${p.status === 'generated' ? 'ok' : 'failed'}">${
           p.status === 'generated' ? '已生成' : '已拒绝'}</span></td>
         <td>${sum}</td>
@@ -331,18 +356,18 @@ async function delPlan(id) {
 }
 function chip(it) {
   const deps = it.depends_on && it.depends_on.length
-    ? `<span class="deps">← ${it.depends_on.join('，')}</span>` : '';
-  return `<span class="chip ${it.status}">${it.task_name} <b>${it.partition}</b>
+    ? `<span class="deps">← ${it.depends_on.map(esc).join('，')}</span>` : '';
+  return `<span class="chip ${it.status}">${esc(it.task_name)} <b>${esc(it.partition)}</b>
     <span class="st">${STATUS_CN[it.status]}</span>${deps}</span>`;
 }
 function renderPlan(plan) {
   if (plan.status === 'rejected') {
-    return `<div class="panel"><h2>计划 #${plan.id}（已拒绝）${plan.target_name
-      } @ ${plan.biz_date}</h2><p>${plan.reject_reason}</p></div>`;
+    return `<div class="panel"><h2>计划 #${plan.id}（已拒绝）${esc(plan.target_name)
+      } @ ${esc(plan.biz_date)}</h2><p>${esc(plan.reject_reason)}</p></div>`;
   }
   const s = plan.summary || {};
   const snapTasks = (plan.snapshot.tasks || []).map(t =>
-    `<span class="tag ver">${t.name} v${t.config_version}</span>`).join(' ');
+    `<span class="tag ver">${esc(t.name)} v${t.config_version}</span>`).join(' ');
   const backfill = plan.items.filter(i => i.action === 'backfill');
   const skipped = plan.items.filter(i => i.action === 'skip');
   const waves = {};
@@ -351,8 +376,8 @@ function renderPlan(plan) {
     `<div class="wave"><h3>第 ${w} 波（${waves[w].length} 个分区，波内可并行）</h3>${
       waves[w].map(chip).join('')}</div>`).join('');
   return `<div class="panel">
-    <h2>计划 #${plan.id}：${plan.target_name} @ ${plan.biz_date}
-      <span class="hint">（生成于 ${plan.created_at}）</span></h2>
+    <h2>计划 #${plan.id}：${esc(plan.target_name)} @ ${esc(plan.biz_date)}
+      <span class="hint">（生成于 ${esc(plan.created_at)}）</span></h2>
     <p>待回填 <b>${s.backfill}</b> 个分区 / 已就绪跳过 <b>${s.skip}</b> 个 /
        共 <b>${s.waves}</b> 个执行波次；
        缺失 ${s.by_status.missing} · 失败 ${s.by_status.failed} · 版本过期 ${s.by_status.stale}</p>
@@ -361,6 +386,86 @@ function renderPlan(plan) {
     ${skipped.length ? `<div class="wave"><h3>已就绪（跳过，不再向上展开）</h3>${
       skipped.map(chip).join('')}</div>` : ''}
   </div>`;
+}
+
+/* ---------- 敏感字段血缘核查 ---------- */
+const LIN_STATUS = {exposed: ['裸露', 'failed'], pending: ['待核实', 'stale'], safe: ['安全', 'ok']};
+const PENDING_TYPE = {unmapped: '缺少字段映射', cycle: '映射成环', limit: '超出安全上限'};
+
+async function runLineage() {
+  const box = $('#lineage-result');
+  box.innerHTML = '';
+  const sf = $('#l-sensitive').files[0], mf = $('#l-mapping').files[0];
+  if (!sf || !mf) { showMsg('请同时上传敏感源字段清单与字段映射两份 CSV', true); return; }
+  const fd = new FormData();
+  fd.append('target_task_id', +$('#l-target').value);
+  fd.append('columns', $('#l-columns').value);
+  fd.append('sensitive_file', sf);
+  fd.append('mapping_file', mf);
+  try {
+    const r = await api('/api/lineage/check', {method: 'POST', body: fd});
+    box.innerHTML = renderLineage(r);
+    showMsg('核查完成');
+  } catch (e) { showMsg(e.body, true); }
+}
+function pathChain(p) {
+  return p.map((s, i) => {
+    const node = `<code>${esc(s.task)}.${esc(s.field)}</code>`;
+    return i === 0 ? node : ` ←(${esc(s.mode || '')}) ` + node;
+  }).join('');
+}
+function renderLineage(r) {
+  const s = r.summary;
+  let html = `<div class="panel"><h2>核查结果：<code>${esc(r.target.name)}</code>
+    <span class="hint">（敏感源 ${r.counts.sensitive} 条 · 映射 ${r.counts.mappings} 条）</span></h2>
+    <p><span class="tag failed">裸露 ${s.exposed}</span>
+       <span class="tag stale">待核实 ${s.pending}</span>
+       <span class="tag ok">安全 ${s.safe}</span></p>`;
+  if (r.warnings && r.warnings.length)
+    html += `<p class="hint">⚠ ${r.warnings.map(esc).join('；')}</p>`;
+  html += '</div>';
+  for (const c of r.columns) {
+    const [label, cls] = LIN_STATUS[c.status];
+    let body = '';
+    if (c.exposed_paths.length) {
+      body += `<div class="wave"><h3>裸露路径（全程直传至敏感源）</h3>` +
+        c.exposed_paths.map((p, i) =>
+          `<span class="chip failed">#${i + 1} ${pathChain(p)} <b>【敏感源】</b></span>`).join('') +
+        `</div>`;
+    }
+    if (c.pending.length) {
+      body += `<div class="wave"><h3>待核实（不可判安全）</h3>` +
+        c.pending.map(p =>
+          `<span class="chip stale">[${PENDING_TYPE[p.type] || esc(p.type)}] ${esc(p.detail)}${
+            p.path && p.path.length ? `<span class="deps">${pathChain(p.path)}</span>` : ''
+          }</span>`).join('') + `</div>`;
+    }
+    if (!body) body = '<p class="hint">未发现裸露路径，血缘映射完整，可判安全。</p>';
+    const masked = c.masked_edges
+      ? `<span class="hint">（脱敏截断 ${c.masked_edges} 处）</span>` : '';
+    html += `<div class="panel"><h2>列 <code>${esc(c.column)}</code>
+      <span class="tag ${cls}">${label}</span> ${masked}</h2>${body}</div>`;
+  }
+  return html;
+}
+function downloadCsv(name, rows) {
+  const text = rows.map(r => r.map(c =>
+    /[",\n]/.test(c) ? '"' + String(c).replace(/"/g, '""') + '"' : c).join(',')).join('\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob(['\ufeff' + text], {type: 'text/csv;charset=utf-8'}));
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+function downloadSamples() {
+  if (!state.dependencies.length) { showMsg('请先在「任务与依赖」中配置任务与依赖', true); return; }
+  const field = 'phone';
+  const mapRows = [['下游任务', '下游字段', '上游任务', '上游字段', '直传/脱敏']]
+    .concat(state.dependencies.map(d => [d.downstream_name, field, d.upstream_name, field, '直传']));
+  const leaf = state.dependencies[state.dependencies.length - 1].upstream_name;
+  downloadCsv('sensitive_fields.csv', [['任务', '字段'], [leaf, field]]);
+  downloadCsv('field_mapping.csv', mapRows);
+  showMsg('已按当前依赖生成示例 CSV（全部直传），可把部分行改为 脱敏 后再上传');
 }
 
 /* ---------- 页签 ---------- */

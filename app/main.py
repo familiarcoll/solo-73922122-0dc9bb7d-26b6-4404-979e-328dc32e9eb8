@@ -1,4 +1,4 @@
-"""FastAPI 入口：数仓分区回填计划。"""
+"""FastAPI 入口：数仓分区回填计划 + 敏感字段血缘核查。"""
 from __future__ import annotations
 
 import json
@@ -6,11 +6,12 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from .db import get_conn, init_db, rows
+from .lineage import check_lineage
 from .planner import build_plan, parse_partition
 from .seed import seed_if_empty
 
@@ -25,7 +26,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="数仓分区回填计划", lifespan=lifespan)
+app = FastAPI(title="数仓回填与敏感字段核查", lifespan=lifespan)
 
 
 # ---------- 请求模型 ----------
@@ -263,6 +264,35 @@ def get_plan(plan_id: int):
 def delete_plan(plan_id: int):
     with get_conn() as conn:
         conn.execute("DELETE FROM plans WHERE id = ?", (plan_id,))
+
+
+# ---------- 敏感字段血缘核查 ----------
+
+@app.post("/api/lineage/check")
+async def lineage_check(target_task_id: int = Form(...),
+                        columns: str = Form(...),
+                        sensitive_file: UploadFile = File(...),
+                        mapping_file: UploadFile = File(...)):
+    """逐列追溯敏感源字段是否全程直传到目标表。
+
+    上传两份 UTF-8 CSV（各 ≤ 256 KiB）：敏感源字段清单（任务,字段）、
+    字段映射（下游任务,下游字段,上游任务,上游字段,直传/脱敏）。
+    输入不合法时返回 400 + 错误列表。
+    """
+    sensitive_bytes = await sensitive_file.read()
+    mapping_bytes = await mapping_file.read()
+    with get_conn() as conn:
+        tasks = rows(conn, "SELECT id, name FROM tasks ORDER BY id")
+        deps = rows(conn, """
+            SELECT dt.name AS downstream_name, ut.name AS upstream_name
+            FROM dependencies d
+            JOIN tasks dt ON dt.id = d.downstream_id
+            JOIN tasks ut ON ut.id = d.upstream_id""")
+    result = check_lineage(tasks, deps, sensitive_bytes, mapping_bytes,
+                           target_task_id, columns)
+    if not result["ok"]:
+        raise HTTPException(400, detail=result["errors"])
+    return result
 
 
 # ---------- 示例数据 ----------
